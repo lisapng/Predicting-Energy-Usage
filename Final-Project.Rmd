@@ -1,0 +1,851 @@
+---
+title: "eSC Predicting Energy Usage Project"
+name: Lisa Nguyen
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+###DATA PREPROCESSING
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+###MERGING OF WEATHER, BUILDING AND HOUSE DATA
+
+```{r}
+library(dplyr)
+library(arrow)
+library(tidyverse)
+library(data.table) 
+library(readr)
+#install.packages("caret")
+library("caret")
+library(e1071)
+library(rpart)
+library(rpart.plot)
+```
+
+```{r}
+# Define directories for other files
+house_file_dir <- "https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/2023-houseData/"
+weather_file_dir <- "https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/weather/2023-weather-data/"
+```
+###*******************************************************FILE DIRECTORY**************************************************************
+1. copy path from static_house_info and import into R Environment 
+
+```{r}
+file_path <- ("/Users/lisagna/Desktop/Projects/static_house_info_387.csv")
+meta_house_DF <- read_csv(file_path)
+```
+#COMBINE STATIC_HOUSE_INFO WITH THE WEATHER DATA
+1. Pull distinct in.county values from meta_house DF 
+2. Loop county code from unique values of counties
+3. For the URL, iterate the county_code to read the URL and grab every row
+4. Assign weather data in.county column to variable county_code
+5. Merge weather_date_list into variable combined_weather_data
+
+
+```{r}
+unique_counties <- unique(meta_house_DF$in.county)
+
+# List to store data frames
+weather_data_list <- list()
+
+# Loop through each county and read the corresponding CSV
+for (county_code in unique_counties) {
+  # Construct the URL for the CSV file for each county
+  csv_url <- paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/weather/2023-weather-data/", county_code, ".csv")
+  
+  # Read the CSV file for each county
+  county_weather_data <- read_csv(csv_url)
+  
+  # Add the "in.county" column with the corresponding county code
+  county_weather_data$in.county <- county_code
+  
+  # Store the data frame in the list
+  weather_data_list[[county_code]] <- county_weather_data
+}
+
+# Combine all data frames into one
+combined_weather_data <- bind_rows(weather_data_list)
+
+# View the combined data frame
+#View(combined_weather_data)
+```
+
+
+
+###*******************************************************IMPORT THE BUILDING/HOUSE DATA + MERGE STATIC************************************************
+Steps
+1. Create empty list of buildings ID
+2. Loop into bldg_ids from houseData (AWS)
+  2.1. Assign house URL data
+  2.2. Store the bldg_id building data$bldg
+  2.3 Append the bldg_id (as.char data type) as building_data
+3. Combine the building data with static_house_info
+4. Convert bldg_id to char 
+5. Left join the static_house_info csv by building id
+6. Convert datetime in combined dataset to POSIXct and filter to only July
+
+```{r}
+# Convert 'bldg_id' to character in meta_house_DF
+meta_house_DF$bldg_id <- as.character(meta_house_DF$bldg_id)
+
+# Create an empty list to store data frames for each building
+building_data_list <- list()
+
+bldg_ids <- c(meta_house_DF$bldg_id) # Replace with actual building IDs
+# Loop through each building and read the corresponding Parquet file
+for (bldg_id in bldg_ids) {
+  # Read the Parquet file for each building
+  b_URL <- paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/2023-houseData/", bldg_id, ".parquet")
+  building_data <- arrow::read_parquet(b_URL)
+  building_data$bldg_id <- bldg_id
+  
+  # Store the data frame in the list
+  building_data_list[[as.character(bldg_id)]] <- building_data
+}
+
+# Combine all data frames into one
+combined_building_data <- do.call(rbind, building_data_list)
+
+# Print the first few rows of combined_building_data
+head(combined_building_data)
+```
+
+
+#####********************************(cont.) MERGE DATAFRAME STATIC_HOUSE_CSV AND HOUSE DATA***********************************************
+
+
+```{r}
+# Combine all data frames into one
+combined_building_data <- do.call(rbind, building_data_list)
+combined_building_house <- data.frame(combined_building_data)
+
+#Convert 'bldg_id' to character before left join
+combined_building_house$bldg_id <- as.character(combined_building_house$bldg_id)
+
+#Add "in.county" column to combined_building_data
+combined_building_house <- combined_building_house %>%
+  left_join(meta_house_DF, by = c("bldg_id" = "bldg_id"))
+
+# Convert 'time' to POSIXct for date manipulation
+combined_building_house <- combined_building_house %>%
+  mutate(time = as.POSIXct(time, format = "%Y-%m-%d %H:%M")) %>%
+  filter(format(time, "%m") == "07")
+
+```
+
+```{r}
+head(combined_building_house)
+
+```
+
+###VIEWING THE OFFICIAL DF
+
+#CHANGE BDF TO TOTAL_INFO AS THE MAIN DATAFRAME WITH ALL ATTRIBUTES
+###MERGE TOTAL_INFO WITH COMBINED_WEATHER_DATA BY DOING A LEFT JOIN WITH COMMON COLUMN, DATA_TIME AND IN.COUNTY
+
+```{r}
+merged_df <- combined_building_house
+
+merged_df <- left_join(merged_df, combined_weather_data, 
+                        by = c("time" = "date_time", "in.county"))
+
+#View the final combined data frame
+names(merged_df)
+
+```
+
+####CREATE TOTAL ENERGY USAGE COLUMN TO ADD TO MERGED_DF
+#merged_df is combined weather, house and building dataframe
+###Create Total Energy Consumption
+
+```{r}
+#APPEND INTO MERGED_DF, NEW COLUMN FOR TOTAL ENERGY CONSUMPTION
+total_electric_HVAC_energy <- function(df) {
+  columns_to_sum <- c(
+    "out.electricity.ceiling_fan.energy_consumption",
+    "out.electricity.cooling_fans_pumps.energy_consumption",
+    "out.electricity.cooling.energy_consumption",
+    "out.electricity.freezer.energy_consumption",
+    "out.electricity.heating_fans_pumps.energy_consumption",
+    "out.electricity.heating_hp_bkup.energy_consumption",
+    "out.electricity.heating.energy_consumption",
+    "out.electricity.hot_tub_heater.energy_consumption",
+    "out.electricity.hot_tub_pump.energy_consumption",
+    "out.electricity.hot_water.energy_consumption",
+    "out.electricity.lighting_exterior.energy_consumption",
+    "out.electricity.lighting_garage.energy_consumption",
+    "out.electricity.lighting_interior.energy_consumption",
+    "out.electricity.mech_vent.energy_consumption",
+    "out.electricity.plug_loads.energy_consumption",
+    "out.electricity.pool_heater.energy_consumption",
+    "out.electricity.refrigerator.energy_consumption",
+    "out.electricity.well_pump.energy_consumption"
+  )
+
+  # Check if columns exist in the dataframe
+  missing_columns <- setdiff(columns_to_sum, colnames(df))
+  if (length(missing_columns) > 0) {
+    cat("Warning: The following columns are missing in the dataframe:", paste(missing_columns, collapse = ", "), "\n")
+  }
+
+  # Perform row-wise sum for existing columns
+  df$total_electric_HVAC_energy_used <- rowSums(df[, columns_to_sum, drop = FALSE], na.rm = TRUE)
+
+  return(df)
+}
+
+
+```
+
+
+```{r}
+total_electric_HVAC_energy(merged_df)
+```
+
+###********************************************REFINED THE MERGED DATEFRAME FUNCTION (DATETIME)******************************************************
+
+```{r}
+#refine the static housing data
+houseTime_filter <- function(df) {
+  
+  #get the details from the time sample
+  posix_time <- as.POSIXlt(df$time)
+  df$month <- posix_time$mon + 1
+  df$day <- posix_time$mday
+  df$hour <- posix_time$hour
+  
+  #we will focus on July
+  df <- df[df$month==7,]
+  
+  #remove anytime with an NA
+  df <- df[!is.na(df$month),]
+  
+  #update the df, so that we have one field for HVAC usage
+  df <- total_electric_HVAC_energy(df)
+  
+  #sort df
+  df_summary <- df %>%
+    arrange(month, day, hour)
+  
+  return(df_summary)
+}
+
+```
+
+```{r}
+officialMerged_DF <- houseTime_filter(merged_df)
+officialMerged_DF
+```
+
+###*****************************************************(cont.) REFINE THE MERGED DATAFRAME**********************************************************
+#FUNCTION TO SEPARATE THE MERGED DATAFRAME
+- add the data to the house's dataframe
+
+```{r}
+weatherTime_filter <- function(df){
+  df <- as.data.frame(df)
+  #parse the times in weatherDF
+  #convert the data_time column in weatherDF into POSIXlt object (list-based of data and time)
+  posix_time <- as.POSIXlt(df$time)
+  #Create a new column called 'mon' in weatherDF
+  #+1 due POSIXlt incrementation of month (i.e. January=0...)
+  df$month <- posix_time$mon + 1
+  #Create a new column called 'day' to get day of the month in weatherDF
+  df$day <- posix_time$mday
+  #Create a new column called 'hour' to assign the values of the hour in datetime column
+  df$hour <- posix_time$hour
+  
+  #Focus on month of July
+  df <- df[df$month==7,]
+  
+  #sort the df by month, day and hour
+  df <- df %>% arrange(month, day, hour)
+  
+  #since both were grouped/sorted the same way, we can combine columns
+  df$temp <- df$`Dry Bulb Temperature [°C]`
+  df$wind <- df$`Wind Speed [m/s]`
+  df$horizonal_radiation <- df$`Global Horizontal Radiation [W/m2]`
+  df$normal_radiation <- df$`Direct Normal Radiation [W/m2]`
+  df$diffuse_radiation <- df$`Diffuse Horizontal Radiation [W/m2]`
+  return(df)
+}
+
+officialMerged_DF <- weatherTime_filter(officialMerged_DF)
+```
+
+###****************************REVIEW THE COLUMN OF OFFICIAL MERGED DF*****************************
+```{r}
+names(officialMerged_DF)
+```
+
+###**********************************ANNOTATION SELECTION FOR COLUMNS*************************************
+
+
+```{r}
+annotation <- list(
+  'in.insulation_ceiling' = list(
+    'None' = 0,
+    'Uninsulated' = 0,
+    'R-7' = 1,
+    'R-13' = 2,
+    'R-19' = 2,
+    'R-30' = 3,
+    'R-38' = 4,
+    'R-49' = 5
+  ),
+  'in.insulation_floor' = list(
+    'None' = 0,
+    'Uninsulated' = 0,
+    'Ceiling R-19' = 2,
+    'Ceiling R-13' = 1
+  ),
+  'in.insulation_foundation_wall' = list(
+    'None' = 0,
+    'Wall R-15, Exterior' = 3,
+    'Wall R-10, Exterior' = 2,
+    'Uninsulated' = 0,
+    'Wall R-5, Exterior' = 1
+  ),
+  'in.insulation_rim_joist' = list(
+    'None' = 0,
+    'R-5, Exterior' = 1,
+    'R-10, Exterior' = 2,
+    'Uninsulated' = 0,
+    'R-15, Exterior' = 3
+  ),
+  'in.insulation_roof' = list(
+    'None' = 0,
+    'Unfinished, Uninsulated' = 0,
+    'Finished, Uninsulated' = 0,
+    'Finished, R-7' = 2,
+    'Finished, R-13' = 4,
+    'Finished, R-19' = 6,
+    'Finished, R-38' = 8,
+    'Finished, R-30' = 9,   
+    'Finished, R-49' = 10
+  ),
+  'in.insulation_slab' = list(
+    'None' = 0,
+    '2ft R5 Under, Horizontal' = 2,
+    '2ft R10 Under, Horizontal' = 3,
+    '2ft R10 Perimeter, Vertical' = 3,
+    'Uninsulated' = 1,
+    '2ft R5 Perimeter, Vertical' = 2
+  ),
+  'in.insulation_wall' = list(
+    'None' = 0,
+    'Wood Stud, R-11' = 2,
+    'CMU, 6-in Hollow, Uninsulated' = 1,
+    'CMU, 6-in Hollow, R-7' = 2,
+    'CMU, 6-in Hollow, R-11' = 3,
+    'CMU, 6-in Hollow, R-15' = 3,
+    'Brick, 12-in, 3-wythe, Uninsulated' = 2,
+    'Brick, 12-in, 3-wythe, R-15' = 4,
+    'Brick, 12-in, 3-wythe, R-19' = 5,
+    'CMU, 6-in Hollow, R-19' = 6,
+    'Brick, 12-in, 3-wythe, R-11' = 3,
+    'Wood Stud, R-15' = 3,
+    'Wood Stud, R-19' = 4,
+    'Brick, 12-in, 3-wythe, R-7' = 3,
+    'Wood Stud, Uninsulated' = 1,
+    'Wood Stud, R-7' = 1
+  ),
+  'in.windows' = list(
+    'None' = 0,
+    'Double, Clear, Metal, Air, Exterior Clear Storm' = 4,
+    'Single, Clear, Metal' = 1,
+    'Double, Clear, Metal, Air' = 4,
+    'Single, Clear, Metal, Exterior Clear Storm' = 3,
+    'Triple, Low-E, Non-metal, Air, L-Gain' = 4,
+    'Single, Clear, Non-metal, Exterior Clear Storm' = 2,
+    'Single, Clear, Non-metal' = 1,
+    'Double, Clear, Non-metal, Air' = 2,
+    'Double, Clear, Non-metal, Air, Exterior Clear Storm' = 3,
+    'Double, Low-E, Non-metal, Air, M-Gain' = 4
+  )
+)
+```
+
+
+```{r}
+#use these columns to check about insulation
+columnsToCheck <- names(annotation)
+columnsToCheck <- columnsToCheck[columnsToCheck != "in.insulation_roof"]
+columnsToCheck
+```
+
+###********************GET OTHER INSULATION IN MERGED DATAFRAME***********************
+
+```{r}
+get_other_insulation <- function(df) {
+  # Create an empty list to store individual data
+  insulation_value <- list()
+
+  # Iterate over each column to check
+  for (col in columnsToCheck) {
+    # Get the corresponding annotation value for the column and row value
+    value <- df[[col]]
+    for (i in seq_along(value)) {
+      insulation_value[[paste0(col, "_", i)]] <- annotation[[col]][[value[i]]]
+    }
+  }
+
+  # Calculate the sum of individual data
+  sumIndData <- sum(unlist(insulation_value, use.names = FALSE))
+
+  return(sumIndData)
+}
+
+#result <- get_other_insulation(officialMerged_DF)
+```
+
+###*******************GET ROOF INSULATION FUNCTION********************************
+
+```{r}
+get_roof_insulation <- function(df) {
+  # Handle potential column absence
+  if ("in.insulation_roof" %in% colnames(df)) {
+    # Use match instead of recursive indexing
+    insulation_value <- match(df$in.insulation_roof, names(annotation[["in.insulation_roof"]]))
+  } else {
+    insulation_value <- NA
+    warning("Column 'in.insulation_roof' not found.")
+  }
+
+  return(insulation_value)
+}
+
+```
+
+###ADDITIONAL REFINEMENT FOR DATA
+- CALCULATE EVERY USAGE PER SQUARE
+
+```{r}
+#first_time = TRUE
+# Initialize an empty list to store results
+result_list <- list()
+num_to_do <- nrow(officialMerged_DF)
+
+# Loop over rows
+for (i in 1:num_to_do) {
+  row <- officialMerged_DF[i,]
+  number <- row$bldg_id
+  if (as.integer(i/10) * 10 == i) {
+    print(paste("house number", number, " iteration: ", i, " out of: ", num_to_do))
+  }
+  
+  # Filter data for the specific house
+  new_df <- subset(officialMerged_DF, bldg_id == number)
+  
+  # Mutate the column using the updated function
+  new_df <- new_df %>%
+    mutate(roof_insulation = get_roof_insulation(new_df))
+  
+  new_df$bldg_id <- number
+  new_df$window_areas <- new_df$in.window_areas
+  new_df$windows <- new_df$in.windows
+  new_df$number_of_stories <- new_df$in.geometry_stories
+  new_df$usage_level <- new_df$in.usage_level
+  new_df$income <- new_df$in.income
+  new_df$sqft <- new_df$in.sqft
+  new_df$county <- new_df$in.county
+  new_df$lat <- new_df$in.weather_file_latitude
+  new_df$long <- new_df$in.weather_file_longitude
+  new_df$in.hvac_cooling_efficiency <- new_df$in.hvac_cooling_efficiency
+  
+  new_df$other_insulation <- get_other_insulation(new_df)
+  new_df$ducts <- new_df$in.ducts
+  
+  # Get the weather data, at the day current summary level
+  new_df <- weatherTime_filter(new_df)
+  
+  # Get the target variable (energy_per_sqft)
+  new_df$energy_per_sqft <- new_df$total_electric_HVAC_energy_used / new_df$sqft
+  
+    # Append the result to the list
+  result_list[[number]] <- new_df
+
+}
+
+
+
+# Combine the results into a single dataframe
+final_result <- do.call(rbind, result_list)
+
+
+```
+
+```{r}
+
+convert_strings <- function(data){
+  
+  #convert income into something useful
+  data$income <- as.factor(data$income)
+  new_order <- c("<10000", "10000-14999", "15000-19999", "20000-24999", "25000-29999", "30000-34999", "35000-39999",  
+                 "40000-44999", "45000-49999", "50000-59999", "60000-69999", "70000-79999", "80000-99999",
+                 "100000-119999", "120000-139999",  "140000-159999", "160000-179999",  "180000-199999", "200000+")
+  data$income <- factor(data$income, levels = new_order)
+  data$income <- as.integer(data$income)
+  
+  
+  #convert ducts
+  data$ducts <- as.factor(data$ducts)
+  new_order <- c("None", "30% Leakage, Uninsulated",  "0% Leakage, Uninsulated", "10% Leakage, R-8")
+  data$ducts <- factor(data$ducts, levels = new_order)
+  data$ducts <- as.integer(data$ducts)
+  
+  
+  data$in.hvac_cooling_efficiency <- as.factor(data$in.hvac_cooling_efficiency)
+  new_order <- c("None",  "Heat Pump", "AC, SEER 10", "AC, SEER 13",
+                 "AC, SEER 15", "AC, SEER 8" ,"Room AC, EER 8.5" , "Room AC, EER 10.7", 
+                 "Room AC, EER 9.8", "Room AC, EER 12.0")
+  data$in.hvac_cooling_efficiency <- factor(data$in.hvac_cooling_efficiency, levels = new_order)
+  data$in.hvac_cooling_efficiency <- as.integer(data$in.hvac_cooling_efficiency)
+  
+  
+  data$usage_level <- as.factor(data$usage_level)
+  new_order <- c( "Low", "Medium" , "High" )
+  data$usage_level <- factor(data$usage_level, levels = new_order)
+  data$usage_level <- as.integer(data$usage_level)
+  
+  data$window_areas <- as.factor(data$window_areas)
+  new_order <- c("F6 B6 L6 R6", "F9 B9 L9 R9", "F12 B12 L12 R12", 
+                 "F15 B15 L15 R15", "F18 B18 L18 R18" , "F30 B30 L30 R30")
+  data$window_areas <- factor(data$window_areas, levels = new_order)
+  data$window_areas <- as.integer(data$window_areas)
+  
+  data$windows <- as.factor(data$windows)
+  new_order <- c(
+    "Single, Clear, Metal",    
+    "Single, Clear, Non-metal" ,     
+    "Single, Clear, Metal, Exterior Clear Storm",
+    "Single, Clear, Non-metal, Exterior Clear Storm", 
+    "Double, Clear, Metal, Air" ,
+    "Double, Clear, Metal, Air, Exterior Clear Storm",
+    "Double, Clear, Non-metal, Air" ,     
+    "Double, Low-E, Non-metal, Air, M-Gain",       
+    "Double, Clear, Non-metal, Air, Exterior Clear Storm",
+    "Triple, Low-E, Non-metal, Air, L-Gain")
+  data$windows <- factor(data$windows, levels = new_order)
+  data$windows <- as.integer(data$windows)
+  
+  data$county <- gsub("G", "", data$county, ignore.case = TRUE)
+  data$county <- as.integer(data$county)
+  
+  #attributes not useful for predictions
+  data$house <- NULL #have building_id
+  data$poverty_level <- NULL #have income
+  data$max_temp <- NULL #have min_temp
+  
+  return(data)
+}
+
+
+```
+
+
+
+```{r}
+official_data <- convert_strings(final_result)
+official_data <- official_data[!is.na(official_data$income),]
+```
+
+```{r}
+names(official_data)
+```
+
+###REMOVE THE IRRELEVANT COLUMNS AND SPLIT THE OFFICIAL DATA INTO A NEW DATAFRAME WITH FUCTION AND LEVELED COLUMNS FOR MODELING
+
+```{r}
+#"bldg_id" is in column 44 and "in.hvac.cooling_efficiency" is in column 105
+selected_columns <- c(44, 105, (ncol(official_data) - 21):ncol(official_data))
+
+#select the specified columns from the official_data
+official_split_data <- official_data[, selected_columns]
+
+names(official_split_data)
+```
+###PUT OFFICIAL_SPLIT_DATA IN A CSV FILE USING WRITE_CSV IN FUNCTION
+
+
+```{r}
+library(readr)
+write_csv(official_split_data, "df_only_July_cleaned.csv")
+full_data <- read_csv("df_only_July_cleaned.csv")
+```
+
+###*************************************************************MODELING START***********************************************
+1. Subset the data to omit columns not useful for modeling and analysis
+
+```{r}
+data_subset <- full_data[, !(colnames(full_data) %in% c(
+  "total_electric_HVAC_energy_used",
+  "month",
+  "ducts",
+  "county",
+  "bldg_id",
+  "roof_insulation",
+  "lat",
+  "long"
+))]
+
+
+summary(data_subset)
+```
+
+2. Use the subsetted data for modeling and further split it for training and testing the model
+- 'createDataPartition' helps in creating a random split of the subsetted data into training and testing sets
+- The (p = 0.8) parameter specifies the proportion of the data to be assigned to the training set. In this case, 80% of the data will be used for training
+- Used the energy_per_sqft as the target variable 
+- 'trainIndex' stores the indices of rows/observations included in the training set
+- 'train_set' represents the training set that'll be used for my machine learning model
+    - is created by subsetting original data (data_subset) using the indices stored in trainIndex
+- 'test_set' represents the test set that will be used to evaluate the performance of my trained model
+    - contains the remaining 20% of the data that was indexed in the 'trainIndex'
+
+
+```{r}
+trainIndex <- createDataPartition(data_subset$energy_per_sqft, p = .8, list = FALSE)
+train_set <- data_subset[trainIndex, ]
+test_set <- data_subset[-trainIndex, ]
+```
+
+###*****************LINEAR REGRESSION MODEL*****************
+
+
+```{r}
+lm_model <- lm(energy_per_sqft ~ ., data=data_subset)
+summary(lm_model)
+```
+```{r}
+## Make predictions on the test set
+test_predictions <- predict(lm_model, newdata=test_set)
+
+## Calculate RMSE (Root Mean Squared Error)
+test_actual <- test_set$energy_per_sqft
+rmse <- sqrt(mean((test_predictions - test_actual)^2))
+print(paste("RMSE for Linear Regression Model on Test Set:", rmse))
+```
+
+
+###****RPART TREE MODEL*********
+
+
+```{r}
+library(rpart)
+library(rpart.plot)
+library(caret)
+```
+```{r}
+## Train the decision tree model
+dt_model <- train(energy_per_sqft ~ ., data=train_set, method="rpart")
+```
+```{r}
+## Visualize the decision tree
+rpart.plot(dt_model$finalModel)
+```
+```{r}
+## Make predictions on the test set
+test_predictions_dt <- predict(dt_model, newdata=test_set)
+```
+```{r}
+## Calculate RMSE
+test_actuals_dt <- test_set$energy_per_sqft
+rmse_dt <- sqrt(mean((test_predictions_dt - test_actuals_dt)^2))
+print(paste("RMSE for Decision Tree on Test Set:", rmse_dt))
+```
+
+###***************FURTHER PREDICTION********************
+# Assume the overall temperature increases by 5 degrees in the next 10 years. We need to make predictions about energy usage.
+
+
+```{r}
+new_data <- full_data
+new_data$temp <- new_data$temp + 5
+new_data$energy_per_sqft <- NULL
+```
+
+###*************LINEAR REGRESSION MODEL*****************
+#Make Predictions for new temp for the Linear Regression Model
+
+```{r}
+new_data$lm_predictions <- predict(lm_model, newdata=new_data)
+```
+# get total energy usage by multiplying sqft
+```{r}
+new_data$total_lm_predictions<-new_data$lm_predictions*new_data$sqft
+```
+
+###*************RPART DECISION TREE*****************
+#Make Predictions for new temp for the RPart Decision Tree
+
+```{r}
+new_data$dt_predictions <- predict(dt_model, newdata=new_data)
+```
+# get total energy usage by multiplying sqft
+```{r}
+new_data$total_dt_predictions<-new_data$dt_predictions*new_data$sqft
+```
+
+###*********** DATA FRAME of hourly sum of energy usage predictions with new temp ************
+- Create a dataframe of hourly sum
+```{r}
+library(dplyr)
+```
+
+```{r}
+hourly_energy_usage <- new_data %>%
+  group_by(hour) %>%
+  summarise(
+    lm_sum = sum(total_lm_predictions),
+    dt_sum = sum(total_dt_predictions)
+  )
+
+head(hourly_energy_usage)
+```
+
+###********************* DATA FRAME of hourly sum of actual energy usage **********************
+- Take the same steps as creating a dataframe for new temp prediction
+
+```{r}
+new_data_actual_null <- full_data
+new_data_actual_null$energy_per_sqft <- NULL
+
+new_data_actual_null$lm_predictions <- predict(lm_model, newdata=new_data_actual_null)
+new_data_actual_null$dt_predictions <- predict(dt_model, newdata=new_data_actual_null)
+
+
+# get total energy usage by multiplying sqft
+new_data_actual_null$total_lm_predictions<-new_data_actual_null$lm_predictions*new_data_actual_null$sqft
+new_data_actual_null$total_dt_predictions<-new_data_actual_null$dt_predictions*new_data_actual_null$sqft
+
+actual_hourly_energy_usage <- new_data_actual_null %>%
+  group_by(hour) %>%
+  summarise(
+    lm_sum_actual = sum(total_lm_predictions),
+    dt_sum_actual = sum(total_dt_predictions)
+  )
+
+head(actual_hourly_energy_usage)
+```
+```{r}
+library(dplyr)
+
+
+full_data$total_energy_hour <- full_data$energy_per_sqft * full_data$sqft
+
+# Create a dataframe of sum of average total energy usage by hour
+sum_avg_hourly_energy_usage <- full_data %>%
+  group_by(hour) %>%
+  summarise(
+    sum_avg_energy = sum(total_energy_hour)
+  )
+
+head(sum_avg_hourly_energy_usage)
+
+```
+
+
+###************************ DATAFRAME OF RESIDUALS OF ACTUAL ENERGY USAGE **********************
+
+
+```{r}
+# Replace missing values with zeros
+residuals_lm <- as.numeric(test_actual) - as.numeric(test_predictions)
+residuals_dt <- as.numeric(test_actuals_dt) - as.numeric(test_predictions_dt)
+
+residuals_lm[is.na(residuals_lm)] <- 0
+residuals_dt[is.na(residuals_dt)] <- 0
+
+#residuals_lm <- test_actual - test_predictions
+#residuals_dt <- test_actuals_dt - test_predictions_dt
+
+# Create a data frame of residuals
+residual_data <- data.frame(Linear_Regression = residuals_lm,
+                            Decision_Tree = residuals_dt)
+```
+
+###****************************************************** DATA VISUALIZATION ****************************************************
+
+```{r}
+library(ggplot2)
+comparison_data <- data.frame(Actual = sum_avg_hourly_energy_usage$sum_avg_energy,
+                              Linear_Regression = hourly_energy_usage$lm_sum,
+                              Decision_Tree = hourly_energy_usage$dt_sum,
+                              hour = sum_avg_hourly_energy_usage$hour)
+
+ggplot(comparison_data, aes(x = hour)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  labs(x = "Hour of the Day", 
+       y = "Total Energy Usage",
+       title = "Actual by Hour of the Day") +
+  scale_color_manual(values = c("Actual" = "seagreen")) +
+  scale_x_continuous(breaks = 0:23) +
+  theme_minimal()
+
+```
+```{r}
+summary(sum_avg_hourly_energy_usage)
+```
+```{r}
+# Create a box plot
+ggplot(sum_avg_hourly_energy_usage, aes(x = sum_avg_energy, y = as.factor(hour))) +
+  geom_boxplot() +
+  labs(x =  "Average Total Energy Usage", y ="Hour of the Day", title = "Box Plot of Average Total Energy Usage by Hour") +
+  theme_minimal()
+```
+
+```{r}
+comparison_data <- data.frame(Actual = sum_avg_hourly_energy_usage$sum_avg_energy,
+                              Linear_Regression = hourly_energy_usage$lm_sum,
+                              Decision_Tree = hourly_energy_usage$dt_sum,
+                              hour = sum_avg_hourly_energy_usage$hour)
+
+ggplot(comparison_data, aes(x = hour)) +
+  geom_line(aes(y = Linear_Regression, color = "Linear Regression")) +
+  geom_line(aes(y = Decision_Tree, color = "Decision Tree")) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  labs(x = "Hour of the Day", 
+       y = "Total Energy Usage",
+       title = "Actual vs. Predicted Values") +
+  scale_color_manual(values = c("Actual" = "seagreen", "Linear Regression" = "darkviolet", "Decision Tree" = "deeppink")) +
+  scale_x_continuous(breaks = 0:23) +
+  theme_minimal()
+```
+
+
+```{r}
+residual_data_long <- tidyr::gather(residual_data, key = "Model", value = "Residual")
+ggplot(residual_data_long, aes(x = Model, y = Residual, color = Model)) +
+  geom_point() +
+  labs(x = "Model", 
+       y = "Residuals",
+       title = "Scatter Plot of Residuals") +
+  scale_color_manual(values = c("darkviolet", "deeppink")) +
+  theme_minimal()
+```
+```{r}
+ggplot(hourly_energy_usage, aes(x = hour)) +
+  geom_area(aes(y = lm_sum, fill = "Linear Regression"), alpha = 0.7) +
+  geom_area(aes(y = dt_sum, fill = "Decision Tree"), alpha = 0.7) +
+  labs(x = "Hour of the Day",
+       y = "Total Energy Usage (Predicted)",
+       title = "Hourly Sum of Predicted Energy Usage in 10 Years") +
+  scale_fill_manual(values = c("Linear Regression" = "darkviolet", "Decision Tree" = "deeppink")) +
+  scale_x_continuous(breaks = 0:23) +  # This makes all hours are shown on the x-axis
+  theme_minimal()
+
+```
+
+```{r}
+load("/Users/lisagna/Desktop/Environment.RData")
+```
+
